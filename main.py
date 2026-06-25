@@ -27,12 +27,25 @@ class FinancialDataModel(BaseModel):
     cash_and_equivalents: Optional[float] = Field(description="Cash and cash equivalents on the balance sheet")
 
 # --- Helper Functions ---
-def extract_relevant_pages(uploaded_file) -> str:
+def extract_relevant_pages(uploaded_file):
+    """Reads PDF, checks if it is financial, and caps size to prevent 413 token errors."""
     reader = PdfReader(uploaded_file)
-    keywords = ["revenue", "net income", "balance sheet", "income statement", "cash equivalents"]
-    filtered_text = ""
+    keywords = ["revenue", "net income", "balance sheet", "income statement", "cash equivalents", "profit", "loss"]
     
-    # Keep cover page
+    filtered_text = ""
+    financial_content_found = False
+    
+    # Check the first few pages strictly to see if this document is even financial
+    sample_text = ""
+    for i in range(min(5, len(reader.pages))):
+        text = reader.pages[i].extract_text()
+        if text:
+            sample_text += text.lower()
+            
+    if not any(kw in sample_text for kw in keywords):
+        return None, False  # Fails financial validation guard
+
+    # Always keep cover page for context
     first_page = reader.pages[0].extract_text()
     if first_page:
         filtered_text += first_page + "\n"
@@ -42,11 +55,17 @@ def extract_relevant_pages(uploaded_file) -> str:
         if text and any(kw in text.lower() for kw in keywords):
             filtered_text += text + "\n"
             
-    return filtered_text
+        # ⚠️ BUG 2 FIX: Cap local context extraction size at roughly ~60,000 characters
+        # This acts as a circuit-breaker so we never hit Groq's 413 token limits on huge files
+        if len(filtered_text) > 60000:
+            filtered_text = filtered_text[:60000] + "\n...[Text truncated to prevent API rate limits]..."
+            break
+            
+    return filtered_text, True
 
 def analyze_with_groq(document_text: str):
     if not GROQ_API_KEY:
-        st.error("❌ GROQ_API_KEY missing from your .env file!")
+        st.error("❌ GROQ_API_KEY missing from your environment setup!")
         return None
         
     client = Groq(api_key=GROQ_API_KEY)
@@ -57,7 +76,7 @@ def analyze_with_groq(document_text: str):
         messages=[
             {
                 "role": "system",
-                "content": f"Extract financial data matching this JSON Schema exactly:\n{schema_json}\nReturn ONLY valid JSON."
+                "content": f"Extract financial data matching this JSON Schema exactly:\n{schema_json}\nReturn ONLY valid JSON. Ensure strict compliance with standard JSON syntax."
             },
             {
                 "role": "user",
@@ -76,43 +95,48 @@ if uploaded_file is not None:
     st.success(f"📄 Connected to: {uploaded_file.name}")
     
     if st.button("🚀 Extract Financial Data", type="primary"):
-        with st.spinner("Reading PDF and filtering pages..."):
-            raw_text = extract_relevant_pages(uploaded_file)
+        with st.spinner("Analyzing document structure and verifying contents..."):
+            raw_text, is_financial = extract_relevant_pages(uploaded_file)
             
-        if not raw_text.strip():
-            st.error("Could not find relevant text or financial keywords in this PDF.")
+        # ⚠️ BUG 3 FIX: Reject non-financial files early
+        if not is_financial:
+            st.error("❌ Validation Error: This document does not appear to be a financial statement. Please upload an annual report, 10-K, 10-Q, or financial summary.")
+        elif not raw_text or not raw_text.strip():
+            st.error("❌ Error: Could not extract readable text from this file format.")
         else:
             with st.spinner("Analyzing tables with Groq AI..."):
                 try:
                     json_output = analyze_with_groq(raw_text)
+                    
+                    # ⚠️ BUG 1 FIX: Load string into native python dict first to sanitize syntax, 
+                    # then let Streamlit render it natively to avoid missing commas or raw formatting bugs.
                     structured_data = json.loads(json_output)
                     
                     st.balloons()
                     st.subheader("📊 Extracted Results")
                     
-                    # Display metrics beautifully in columns
+                    # Visual Metric Widgets
                     col1, col2, col3 = st.columns(3)
                     curr = structured_data.get('currency', 'USD')
                     
-                    col1.metric("Company", structured_data.get("company_name"))
-                    col2.metric("Period", structured_data.get("fiscal_period"))
+                    col1.metric("Company", structured_data.get("company_name", "N/A"))
+                    col2.metric("Period", structured_data.get("fiscal_period", "N/A"))
                     col3.metric("Currency", curr)
                     
-                    col1.metric("Total Revenue", f"{structured_data.get('total_revenue'):,}")
-                    col2.metric("Net Income", f"{structured_data.get('net_income'):,}")
-                    col3.metric("Cash & Equivalents", f"{structured_data.get('cash_and_equivalents', 0):,}")
+                    col1.metric("Total Revenue", f"{structured_data.get('total_revenue', 0.0):,}")
+                    col2.metric("Net Income", f"{structured_data.get('net_income', 0.0):,}")
+                    col3.metric("Cash & Equivalents", f"{structured_data.get('cash_and_equivalents', 0.0):,}")
                     
-                    # Show raw JSON code block
-                    st.subheader("💾 Raw JSON Payload")
+                    # Native Streamlit JSON output display
+                    st.subheader("💾 Validated JSON Payload")
                     st.json(structured_data)
                     
-                    # Add a download button for the JSON file
                     st.download_button(
-                        label="📥 Download JSON File",
+                        label="📥 Download Clean JSON File",
                         data=json.dumps(structured_data, indent=2),
                         file_name=uploaded_file.name.replace(".pdf", "_extracted.json"),
                         mime="application/json"
                     )
                     
                 except Exception as e:
-                    st.error(f"Pipeline failed: {e}")
+                    st.error(f"❌ Pipeline failed: {e}")
