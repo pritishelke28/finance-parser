@@ -33,9 +33,8 @@ def extract_relevant_pages(uploaded_file):
     keywords = ["revenue", "net income", "balance sheet", "income statement", "cash equivalents", "profit", "loss"]
     
     filtered_text = ""
-    financial_content_found = False
     
-    # Check the first few pages strictly to see if this document is even financial
+    # Check the first few pages strictly to see if this document contains financial keywords
     sample_text = ""
     for i in range(min(5, len(reader.pages))):
         text = reader.pages[i].extract_text()
@@ -55,10 +54,9 @@ def extract_relevant_pages(uploaded_file):
         if text and any(kw in text.lower() for kw in keywords):
             filtered_text += text + "\n"
             
-        # ⚠️ BUG 2 FIX: Cap local context extraction size at roughly ~60,000 characters
-        # This acts as a circuit-breaker so we never hit Groq's 413 token limits on huge files
-        if len(filtered_text) > 60000:
-            filtered_text = filtered_text[:60000] + "\n...[Text truncated to prevent API rate limits]..."
+        # 🛡️ SAFE CEILING: Limits characters to ~15,000 to safely stay under Groq's 6,000 token limit
+        if len(filtered_text) > 15000:
+            filtered_text = filtered_text[:15000] + "\n...[Remaining pages truncated to fit API free-tier limits]..."
             break
             
     return filtered_text, True
@@ -98,7 +96,7 @@ if uploaded_file is not None:
         with st.spinner("Analyzing document structure and verifying contents..."):
             raw_text, is_financial = extract_relevant_pages(uploaded_file)
             
-        # ⚠️ BUG 3 FIX: Reject non-financial files early
+        # Reject non-financial files early
         if not is_financial:
             st.error("❌ Validation Error: This document does not appear to be a financial statement. Please upload an annual report, 10-K, 10-Q, or financial summary.")
         elif not raw_text or not raw_text.strip():
@@ -108,8 +106,7 @@ if uploaded_file is not None:
                 try:
                     json_output = analyze_with_groq(raw_text)
                     
-                    # ⚠️ BUG 1 FIX: Load string into native python dict first to sanitize syntax, 
-                    # then let Streamlit render it natively to avoid missing commas or raw formatting bugs.
+                    # Sanitize syntax before showing it in the interface
                     structured_data = json.loads(json_output)
                     
                     st.balloons()
